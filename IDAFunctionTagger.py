@@ -1,35 +1,46 @@
-import idc
+import os
 import json
 import webbrowser
 
+import idc
 from idautils import *
 from idaapi import *
 from idaapi import PluginForm
 
 from PyQt5 import QtGui, QtCore, QtWidgets
 
-open_tag = "[TagList:"
-close_tag = "]"
-tag_separator = ","
 
 class TagManager(object):
+    open_tag = "[TagList:"
+    close_tag = "]"
+    tag_separator = ", "
+
     def __init__(self):
+        self.has_decompiler = False
+
         self.clear()
+        self.init_decompiler()
+
+    def init_decompiler(self):
+        if not idaapi.init_hexrays_plugin():
+            self.has_decompiler = False
+        else:
+            print("Hex-rays version {} detected".format(idaapi.get_hexrays_version()))
+            self.has_decompiler = True
+
+        return
 
     def _addTagToFunction(self, function_name, tag_name):
-        global open_tag
-        global close_tag
-        global tag_separator
 
         function_address = LocByName(function_name)
         function_comment = GetFunctionCmt(function_address, 0)
 
-        tag_list_start = function_comment.find(open_tag)
+        tag_list_start = function_comment.find(self.open_tag)
         if tag_list_start == -1:
-            SetFunctionCmt(function_address, function_comment + open_tag + tag_name + close_tag, 0)
+            SetFunctionCmt(function_address, function_comment + self.open_tag + tag_name + self.close_tag, 0)
             return
 
-        tag_list_end = function_comment.find(close_tag, tag_list_start)
+        tag_list_end = function_comment.find(self.close_tag, tag_list_start)
         if tag_list_end == -1:
             print("Malformed tag list found at address 0x%X" % function_address)
             return
@@ -37,21 +48,26 @@ class TagManager(object):
         tag_list = function_comment[tag_list_start : tag_list_end + 1]
         function_comment = function_comment.replace(tag_list, "")
 
-        tag_list = tag_list[len(open_tag) : len(tag_list) - len(close_tag)]
-        tag_list = tag_list.split(tag_separator)
+        tag_list = tag_list[len(self.open_tag) : len(tag_list) - len(self.close_tag)]
+        tag_list = tag_list.split(self.tag_separator)
 
         if tag_name not in tag_list:
             tag_list.append(tag_name)
         tag_list.sort()
 
-        function_comment = function_comment + open_tag
+        function_comment = function_comment + self.open_tag
         for tag in tag_list:
-            function_comment = function_comment + tag + tag_separator
-        function_comment = function_comment[ : -1] + close_tag
+            function_comment = function_comment + tag + self.tag_separator
+        function_comment = function_comment[ : -1] + self.close_tag
 
         SetFunctionCmt(function_address, function_comment, 0)
 
     def scanDatabase(self, json_configuration):
+        """
+        This loads a JSON file with data belonging 
+        to specific APIs
+        TODO: run this by at loading 
+        """
         configuration = ""
 
         try:
@@ -76,8 +92,6 @@ class TagManager(object):
                     self._addTagToFunction(function_name, str(tag["name"]))
 
     def removeAllTags(self):
-        global open_tag
-        global close_tag
 
         entry_point = BeginEA()
         function_list = Functions(SegStart(entry_point), SegEnd(entry_point))
@@ -85,11 +99,11 @@ class TagManager(object):
         for function_address in function_list:
             function_comment = GetFunctionCmt(function_address, 0)
 
-            tag_list_start = function_comment.find(open_tag)
+            tag_list_start = function_comment.find(self.open_tag)
             if tag_list_start == -1:
                 continue
 
-            tag_list_end = function_comment.find(close_tag, tag_list_start)
+            tag_list_end = function_comment.find(self.close_tag, tag_list_start)
             if tag_list_end == -1:
                 continue
 
@@ -100,9 +114,6 @@ class TagManager(object):
         self._function_list = {}
 
     def update(self):
-        global open_tag
-        global close_tag
-        global tag_separator
 
         self.clear()
 
@@ -112,21 +123,21 @@ class TagManager(object):
         for function_address in function_list:
             function_comment = GetFunctionCmt(function_address, 0)
 
-            tag_list_start = function_comment.find(open_tag)
+            tag_list_start = function_comment.find(self.open_tag)
             if tag_list_start == -1:
                 continue
 
-            tag_list_end = function_comment.find(close_tag, tag_list_start)
+            tag_list_end = function_comment.find(self.close_tag, tag_list_start)
             if tag_list_end == -1:
                 continue
 
-            tag_list = function_comment[tag_list_start + len(open_tag) : tag_list_end]
+            tag_list = function_comment[tag_list_start + len(self.open_tag) : tag_list_end]
             if len(tag_list) == 0:
                 continue
 
-            self._function_list[GetFunctionName(function_address)] = tag_list.split(tag_separator)
+            self._function_list[GetFunctionName(function_address)] = tag_list.split(self.tag_separator)
 
-            tag_list = tag_list.split(tag_separator)
+            tag_list = tag_list.split(self.tag_separator)
             for tag_name in tag_list:
                 if tag_name not in self._tag_list:
                     self._tag_list[tag_name] = []
@@ -140,6 +151,9 @@ class TagManager(object):
         return self._function_list
 
 class TagViewer_t(PluginForm):
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config = os.path.join(root_dir, "cfg", "WindowsCommon.json")
+
     def Update(self):
         self._tag_list_model.clear();
         self._function_list_model.clear();
@@ -181,6 +195,14 @@ class TagViewer_t(PluginForm):
         for i in range(0, 2):
             self._function_list_view.resizeColumnToContents(i)
             self._tag_list_view.resizeColumnToContents(i)
+
+    def _apply_config(self, filename):
+        with open(filename, "r") as input_file:
+            file_buffer = input_file.read()
+
+        self._tag_manager.scanDatabase(file_buffer)
+        self._tag_manager.update()
+        self.Update()
 
     def _onTagClick(self, model_index):
         function_address = BADADDR
@@ -225,13 +247,7 @@ class TagViewer_t(PluginForm):
         if len(file_path[0]) == 0:
             return
 
-        input_file = open(file_path[0], "r")
-        file_buffer = input_file.read()
-        input_file.close()
-
-        self._tag_manager.scanDatabase(file_buffer)
-        self._tag_manager.update()
-        self.Update()
+        self._apply_config(file_path)
 
     def _onRemoveAllTagsClick(self):
         self._tag_manager.removeAllTags()
@@ -329,7 +345,8 @@ class TagViewer_t(PluginForm):
 
         layout.addLayout(controls_layout)        
 
-        self.Update()
+        self._apply_config(self.default_config)
+        #self.Update()
 
         self._parent_widget.setLayout(layout)
 
@@ -340,7 +357,6 @@ class TagViewer_t(PluginForm):
         return PluginForm.Show(self, "Function Tags", options = PluginForm.FORM_TAB)
 
 def unloadScript():
-    global TagViewer
     TagViewer.Close(0)
 
     if not uninstallMenus():
@@ -349,7 +365,6 @@ def unloadScript():
     del TagViewer
 
 def openTagViewer():
-    global TagViewer
     TagViewer.Show()
 
 TagViewer = TagViewer_t()
