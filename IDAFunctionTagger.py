@@ -2,6 +2,8 @@ import os
 import json
 import webbrowser
 
+from collections import defaultdict
+
 import idc
 from idautils import *
 from idaapi import *
@@ -10,6 +12,40 @@ from idaapi import PluginForm
 from PyQt5 import QtGui, QtCore, QtWidgets
 
 
+class visitor(idaapi.ctree_visitor_t):
+    def __init__(self, cfunc, results):
+        idaapi.ctree_visitor_t.__init__(self, idaapi.CV_FAST)
+        self.cfunc = cfunc
+        self.results = results
+
+    def visit_expr(self, i):
+        """
+        From FLARE article
+        Search for dw1234 = GetProcAddress("LoadLibrary")
+        """
+        if i.op == idaapi.cot_call:
+            # look for calls to GetProcAddress
+            if idc.Name(i.x.obj_ea) == "GetProcAddress":
+
+                # ASCSTR_C == 0
+                # Check to see if the second argument is a C string
+                if idc.GetStringType(i.a[1].obj_ea) == 0:
+                    targetName = idc.GetString(i.a[1].obj_ea, -1, 0)
+
+                    # Found function name
+                    # Look for global assignment
+                    parent = self.cfunc.body.find_parent_of(i)
+                    if parent.op == idaapi.cot_cast:
+                        # Ignore casts and look for the parent
+                        parent = self.cfunc.body.find_parent_of(parent)
+
+                    if parent.op == idaapi.cot_asg:
+                        # We want to find the left hand side (x)
+                        self.results[targetName] = parent.cexpr.x.obj_ea
+                        idc.MakeName(parent.cexpr.x.obj_ea, targetName)
+
+        return 0
+
 class TagManager(object):
     open_tag = "[TagList:"
     close_tag = "]"
@@ -17,11 +53,12 @@ class TagManager(object):
 
     def __init__(self):
         self.has_decompiler = False
+        self.sneaky_functions = {}
 
         self.clear()
-        self.init_decompiler()
+        self._init_decompiler()
 
-    def init_decompiler(self):
+    def _init_decompiler(self):
         if not idaapi.init_hexrays_plugin():
             self.has_decompiler = False
         else:
@@ -30,8 +67,32 @@ class TagManager(object):
 
         return
 
-    def _addTagToFunction(self, function_name, tag_name):
+    def _get_sneaky_functions(self):
+        """
+        Populates the dictionary of sneaky functions,
+        containing {'func_name': dw_abc, ...}
+        """
+        sneaky = {}
 
+        for f_ea in Functions():
+            try:
+                cf = decompile(f_ea)
+            except DecompilationFailure as e:
+                continue
+
+            results = {} # Scope is a function
+            v = visitor(cf, results)
+            v.apply_to(cf.body, None)
+
+            if results:
+                sneaky.update(results)
+
+        self.sneaky_functions = sneaky
+
+    def _addTagToFunction(self, function_name, tag_name):
+        """
+        This is the meat and potatoes of this plugin
+        """
         function_address = LocByName(function_name)
         function_comment = GetFunctionCmt(function_address, 0)
 
@@ -62,11 +123,10 @@ class TagManager(object):
 
         SetFunctionCmt(function_address, function_comment, 0)
 
-    def scanDatabase(self, json_configuration):
+    def scanDatabase(self, json_configuration, use_decompiler=False):
         """
         This loads a JSON file with data belonging 
         to specific APIs
-        TODO: run this by at loading 
         """
         configuration = ""
 
@@ -80,7 +140,7 @@ class TagManager(object):
         print("Configuration comment: %s" % configuration["comment"])
 
         for tag in configuration["tag_list"]:
-            print("Scanning for tag '%s'..." % tag["name"])
+            print("1. pass - Scanning for tag '%s'..." % tag["name"])
             for imported_function in tag["import_list"]:
                 function_address = LocByName(str(imported_function))
                 if function_address == BADADDR:
@@ -90,6 +150,39 @@ class TagManager(object):
                 for xref in cross_reference_list:
                     function_name = GetFunctionName(xref)
                     self._addTagToFunction(function_name, str(tag["name"]))
+
+        # Bro, do you even hexrays?
+        if not self.has_decompiler or not use_decompiler:
+            return
+
+        # Find sneaky "imported" functions
+        self._get_sneaky_functions()
+
+        if not self.sneaky_functions:
+            # Didn't find any :(
+            return
+
+        # Second pass
+        # Go over it again finding dynamically imported APIs
+        for tag in configuration["tag_list"]:
+            print("2. pass - Scanning for tag '%s'..." % tag["name"])
+            for imported_function in tag["import_list"]:
+                if imported_function in self.sneaky_functions:
+                    dw_addr = self.sneaky_functions[imported_function]
+
+                    # Now find the "cross references" to this Dword
+                    pseudo_cross_reference_list = XrefsTo(dw_addr, 0)
+                    for xref in pseudo_cross_reference_list:
+                        ty = xref.type
+                        if XrefTypeName(ty) == 'Data_Read':
+                            # In my tests the calls are always "data reads"
+                            # Double check anyway...
+                            if GetMnem(xref.frm) == 'call':
+                                function_name = GetFunctionName(xref.frm)
+                                print "[DEBUG] Found sneaky: {} ({:x})".format(function_name, xref.frm)
+                                self._addTagToFunction(function_name, str(tag["name"]))
+
+
 
     def removeAllTags(self):
 
@@ -110,7 +203,10 @@ class TagManager(object):
             SetFunctionCmt(function_address, function_comment.replace(function_comment[tag_list_start : tag_list_end + 1], ""), 0)
 
     def clear(self):
-        self._tag_list = {}
+        """
+        Poor choice of variable names :D
+        """
+        self._tag_list = defaultdict(list)
         self._function_list = {}
 
     def update(self):
@@ -139,9 +235,6 @@ class TagManager(object):
 
             tag_list = tag_list.split(self.tag_separator)
             for tag_name in tag_list:
-                if tag_name not in self._tag_list:
-                    self._tag_list[tag_name] = []
-
                 self._tag_list[tag_name].append(GetFunctionName(function_address))
 
     def tagList(self):
@@ -151,10 +244,15 @@ class TagManager(object):
         return self._function_list
 
 class TagViewer_t(PluginForm):
+    use_decompiler = False
     root_dir = os.path.dirname(os.path.abspath(__file__))
     default_config = os.path.join(root_dir, "cfg", "WindowsCommon.json")
 
     def Update(self):
+        """
+        This is merely graphical stuff
+        The logic is in `self._tag_manager`
+        """
         self._tag_list_model.clear();
         self._function_list_model.clear();
 
@@ -200,7 +298,7 @@ class TagViewer_t(PluginForm):
         with open(filename, "r") as input_file:
             file_buffer = input_file.read()
 
-        self._tag_manager.scanDatabase(file_buffer)
+        self._tag_manager.scanDatabase(file_buffer, self.use_decompiler)
         self._tag_manager.update()
         self.Update()
 
@@ -247,7 +345,7 @@ class TagViewer_t(PluginForm):
         if len(file_path[0]) == 0:
             return
 
-        self._apply_config(file_path)
+        self._apply_config(file_path[0])
 
     def _onRemoveAllTagsClick(self):
         self._tag_manager.removeAllTags()
@@ -267,6 +365,10 @@ class TagViewer_t(PluginForm):
 
         self._function_list_view.expandAll()
         self._tag_list_view.expandAll()
+
+    def _use_decompiler(self, state):
+        """ Reads checked state from the GUI """
+        self.use_decompiler = (state == QtCore.Qt.Checked)
 
     def OnCreate(self, parent_form):
         self._tag_manager = TagManager()
@@ -327,6 +429,12 @@ class TagViewer_t(PluginForm):
         controls_layout.addWidget(button)
 
         controls_layout.insertStretch(1, -1)
+
+        # Checkbox: decompiler opt-in
+        cb = QtWidgets.QCheckBox('Use decompiler')
+        cb.setCheckState(QtCore.Qt.Unchecked)
+        cb.stateChanged.connect(self._use_decompiler)
+        controls_layout.addWidget(cb)
 
         button = QtWidgets.QPushButton()
         button.setText("Update")
